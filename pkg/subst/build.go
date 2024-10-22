@@ -3,6 +3,7 @@ package subst
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	decrypt "github.com/bedag/subst/internal/decryptors"
 	ejson "github.com/bedag/subst/internal/decryptors/ejson"
@@ -12,6 +13,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/kustomize/api/resource"
 )
 
 type Build struct {
@@ -87,45 +89,63 @@ func (b *Build) Build() (err error) {
 
 	// Run Build
 	log.Debug().Msg("substitute manifests")
+	tasks := make(chan *resource.Resource, len(b.Substitutions.Resources.Resources()))
 
-	for _, manifest := range b.Substitutions.Resources.Resources() {
-		var c map[interface{}]interface{}
+	var wg sync.WaitGroup
+	manifestsMutex := sync.Mutex{}
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for manifest := range tasks {
+				var c map[interface{}]interface{}
 
-		mBytes, _ := manifest.MarshalJSON()
-		for _, d := range decryptors {
-			isEncrypted, err := d.IsEncrypted(mBytes)
-			if err != nil {
-				log.Error().Msgf("Error checking encryption for %s: %s", mBytes, err)
-				return err
-			}
-			if isEncrypted {
-				dm, err := d.Decrypt(mBytes)
-				if err != nil {
-					log.Error().Msgf("failed to decrypt %s: %s", mBytes, err)
-					return err
+				mBytes, _ := manifest.MarshalJSON()
+				for _, d := range decryptors {
+					isEncrypted, err := d.IsEncrypted(mBytes)
+					if err != nil {
+						log.Error().Msgf("Error checking encryption for %s: %s", mBytes, err)
+						continue
+					}
+					if isEncrypted {
+						dm, err := d.Decrypt(mBytes)
+						if err != nil {
+							log.Error().Msgf("failed to decrypt %s: %s", mBytes, err)
+							return
+						}
+						c = utils.ToInterface(dm)
+						break
+					}
 				}
-				c = utils.ToInterface(dm)
-				break
+
+				if c == nil {
+					m, _ := manifest.AsYAML()
+
+					c, err = utils.ParseYAML(m)
+					if err != nil {
+						log.Error().Msgf("UnmarshalJSON: %s", err)
+						return
+					}
+				}
+				f, err := b.Substitutions.Eval(c, nil, false)
+				if err != nil {
+					log.Error().Msgf("spruce evaluation failed %s/%s: %s", manifest.GetNamespace(), manifest.GetName(), err)
+					return
+				}
+				manifestsMutex.Lock()
+				b.Manifests = append(b.Manifests, f)
+				manifestsMutex.Unlock()
 			}
-		}
-
-		if c == nil {
-			m, _ := manifest.AsYAML()
-
-			c, err = utils.ParseYAML(m)
-			if err != nil {
-				log.Error().Msgf("UnmarshalJSON: %s", err)
-				return err
-			}
-		}
-
-		f, err := b.Substitutions.Eval(c, nil, false)
-		if err != nil {
-			log.Error().Msgf("spruce evaluation failed %s/%s: %s", manifest.GetNamespace(), manifest.GetName(), err)
-			return err
-		}
-		b.Manifests = append(b.Manifests, f)
+		}()
 	}
+	for i, manifest := range b.Substitutions.Resources.Resources() {
+		tasks <- manifest
+		if i == 0 {
+			log.Debug().Msgf("substitute manifests: %s", manifest)
+		}
+	}
+	close(tasks)
+	wg.Wait()
 
 	return nil
 }
